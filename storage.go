@@ -13,6 +13,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+
+	"code.google.com/p/go.crypto/scrypt"
 	"strings"
 )
 
@@ -21,6 +23,8 @@ const (
 	baseDir          = "/tmp/gostorage/"
 	blobDir          = "blobs"
 	tokenLenBytes    = 32
+	saltLenBytes     = 32
+	hashLenBytes     = 64
 	cookieName       = ".cookie"
 	tokenHeaderField = "X-Qabel-Token"
 )
@@ -31,6 +35,7 @@ type Volume struct {
 	Id          string `json:"public"`
 	WriteToken  Token  `json:"token"`
 	RevokeToken Token  `json:"revoke_token"`
+	salt        []byte
 }
 
 type VolumeServerCookie struct {
@@ -61,9 +66,12 @@ func parseToken(raw string) (Token, error) {
 	return Token(raw), nil
 }
 
-func (t Token) hash() string {
-	// todo implement hashing
-	return string(t)
+func (t Token) hash(salt []byte) (string, error) {
+	hash, err := scrypt.Key([]byte(t), salt, 1<<14, 8, 1, hashLenBytes)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
 }
 
 func createVolume() (*Volume, error) {
@@ -82,6 +90,12 @@ func createVolume() (*Volume, error) {
 	if err != nil {
 		return nil, err
 	}
+	volume.salt = make([]byte, saltLenBytes)
+	_, err = rand.Read(volume.salt)
+	if err != nil {
+		return nil, err
+	}
+
 	err = os.MkdirAll(filepath.Join(baseDir, volume.Id, blobDir), 0700)
 	if err != nil {
 		return nil, err
@@ -98,10 +112,18 @@ func createVolume() (*Volume, error) {
 
 func (vol *Volume) getServerCookie() (*VolumeServerCookie, error) {
 	cookie := &VolumeServerCookie{
-		Id:                vol.Id,
-		HashedWriteToken:  vol.WriteToken.hash(),
-		HashedRevokeToken: vol.RevokeToken.hash(),
+		Id: vol.Id,
 	}
+	var err error
+	cookie.HashedWriteToken, err = vol.WriteToken.hash(vol.salt)
+	if err != nil {
+		return nil, err
+	}
+	cookie.HashedRevokeToken, err = vol.RevokeToken.hash(vol.salt)
+	if err != nil {
+		return nil, err
+	}
+	cookie.Salt = string(vol.salt)
 
 	return cookie, nil
 }
@@ -162,11 +184,21 @@ func readServerCookie(id string) (*VolumeServerCookie, error) {
 }
 
 func (cookie *VolumeServerCookie) verifyWriteToken(t Token) bool {
-	return cookie.HashedWriteToken == t.hash()
+	hash, err := t.hash([]byte(cookie.Salt))
+	if err != nil {
+		log.Print(err)
+		return false
+	}
+	return cookie.HashedWriteToken == hash
 }
 
 func (cookie *VolumeServerCookie) verifyRevokeToken(t Token) bool {
-	return cookie.HashedRevokeToken == t.hash()
+	hash, err := t.hash([]byte(cookie.Salt))
+	if err != nil {
+		log.Print(err)
+		return false
+	}
+	return cookie.HashedRevokeToken == hash
 }
 
 func createHandler(w http.ResponseWriter, r *http.Request) {
