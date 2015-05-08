@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"crypto/rand"
@@ -6,21 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 
 	"code.google.com/p/go.crypto/scrypt"
-	"strings"
 )
 
 const (
-	port             = 8080
-	baseDir          = "/tmp/gostorage/"
 	blobDir          = "blobs"
 	tokenLenBytes    = 32
 	saltLenBytes     = 32
@@ -29,6 +23,10 @@ const (
 	tokenHeaderField = "X-Qabel-Token"
 )
 
+type storageServer struct {
+	baseDir string
+}
+
 type Token string
 
 type Volume struct {
@@ -36,6 +34,7 @@ type Volume struct {
 	WriteToken  Token  `json:"token"`
 	RevokeToken Token  `json:"revoke_token"`
 	salt        []byte
+	server      *storageServer
 }
 
 type VolumeServerCookie struct {
@@ -74,7 +73,7 @@ func (t Token) hash(salt []byte) (string, error) {
 	return string(hash), nil
 }
 
-func createVolume() (*Volume, error) {
+func (s *storageServer) createVolume() (*Volume, error) {
 	volume := &Volume{}
 	rawId := make([]byte, 16)
 	_, err := rand.Read(rawId)
@@ -96,7 +95,7 @@ func createVolume() (*Volume, error) {
 		return nil, err
 	}
 
-	err = os.MkdirAll(filepath.Join(baseDir, volume.Id, blobDir), 0700)
+	err = os.MkdirAll(filepath.Join(s.baseDir, volume.Id, blobDir), 0700)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +137,7 @@ func (vol *Volume) save() error {
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(filepath.Join(baseDir, vol.Id, cookieName), b, 0600)
+	err = ioutil.WriteFile(filepath.Join(vol.server.baseDir, vol.Id, cookieName), b, 0600)
 	if err != nil {
 		return err
 	}
@@ -146,11 +145,11 @@ func (vol *Volume) save() error {
 }
 
 func (vol *Volume) getBlobPath(blobName string) string {
-	return filepath.Join(baseDir, vol.Id, blobDir, blobName)
+	return filepath.Join(vol.server.baseDir, vol.Id, blobDir, blobName)
 }
 
 func (vol *Volume) delete() error {
-	err := os.RemoveAll(filepath.Join(baseDir, vol.Id))
+	err := os.RemoveAll(filepath.Join(vol.server.baseDir, vol.Id))
 	return err
 }
 
@@ -160,7 +159,7 @@ func (vol *Volume) deleteBlob(blobName string) error {
 }
 
 func (vol *Volume) exists() bool {
-	_, err := os.Stat(filepath.Join(baseDir, vol.Id))
+	_, err := os.Stat(filepath.Join(vol.server.baseDir, vol.Id))
 	if err != nil {
 		if os.IsNotExist(err) == false {
 			log.Fatal(err)
@@ -170,9 +169,9 @@ func (vol *Volume) exists() bool {
 	return true
 }
 
-func readServerCookie(id string) (*VolumeServerCookie, error) {
+func (s *storageServer) readServerCookie(id string) (*VolumeServerCookie, error) {
 	cookie := &VolumeServerCookie{}
-	bytes, err := ioutil.ReadFile(filepath.Join(baseDir, id, cookieName))
+	bytes, err := ioutil.ReadFile(filepath.Join(s.baseDir, id, cookieName))
 	if err != nil {
 		return nil, err
 	}
@@ -199,156 +198,4 @@ func (cookie *VolumeServerCookie) verifyRevokeToken(t Token) bool {
 		return false
 	}
 	return cookie.HashedRevokeToken == hash
-}
-
-func createHandler(w http.ResponseWriter, r *http.Request) {
-	volume, err := createVolume()
-	if err != nil {
-		log.Fatal(err)
-		http.Error(w, "Internal error while creating volume.", http.StatusInternalServerError)
-		return
-	}
-	jsn, err := json.Marshal(volume)
-	if err != nil {
-		log.Fatal(err)
-		http.Error(w, "Internal error while creating volume.", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	w.Write(jsn)
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	cleanedPath := path.Clean(r.URL.Path)
-	log.Println(r.Method + " " + cleanedPath)
-	pathTokens := strings.Split(cleanedPath, "/")
-	volume := Volume{}
-	var blobName string
-
-	// First token is empty because of heading slash
-	switch len(pathTokens) {
-	case 2:
-		volume.Id = pathTokens[1]
-	case 3:
-		volume.Id = pathTokens[1]
-		blobName = pathTokens[2]
-	default:
-		http.Error(w, "Invalid request path", http.StatusBadRequest)
-		return
-	}
-
-	switch r.Method {
-	case "GET":
-		if blobName == "" {
-			if volume.exists() == true {
-				http.Error(w, http.StatusText(http.StatusOK), http.StatusOK)
-			} else {
-				http.NotFound(w, r)
-			}
-			return
-		}
-		http.ServeFile(w, r, volume.getBlobPath(blobName))
-	case "POST":
-		if blobName == "" {
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
-		token, err := parseToken(r.Header.Get(tokenHeaderField))
-		if err != nil {
-			http.Error(w, "Token required", http.StatusUnauthorized)
-			return
-		}
-		cookie, err := readServerCookie(volume.Id)
-		if err != nil {
-			if os.IsNotExist(err) {
-				http.NotFound(w, r)
-				return
-			} else {
-				log.Fatal(err)
-				http.Error(w, "Failed to read server cookie", http.StatusInternalServerError)
-				return
-			}
-		}
-		if cookie.verifyWriteToken(token) == false {
-			http.Error(w, "Invalid token", http.StatusForbidden)
-			return
-		}
-		// should we check body size?
-		dst, err := os.Create(volume.getBlobPath(blobName))
-		defer dst.Close()
-		if err != nil {
-			log.Fatal(err)
-			http.Error(w, "Failed to write blob", http.StatusInternalServerError)
-			return
-		}
-
-		_, err = io.Copy(dst, r.Body)
-		if err != nil {
-			log.Fatal(err)
-			http.Error(w, "Failed to write blob", http.StatusInternalServerError)
-			// clean up incompletely written blob
-			volume.deleteBlob(blobName)
-			return
-		}
-	case "DELETE":
-		token, err := parseToken(r.Header.Get(tokenHeaderField))
-		if err != nil {
-			http.Error(w, "Token required", http.StatusUnauthorized)
-			return
-		}
-		cookie, err := readServerCookie(volume.Id)
-		if err != nil {
-			if os.IsNotExist(err) {
-				http.NotFound(w, r)
-				return
-			} else {
-				log.Fatal(err)
-				http.Error(w, "Failed to read server cookie", http.StatusInternalServerError)
-				return
-			}
-		}
-		if blobName != "" {
-			// todo: doc says that write token should be submitted by client does not comply
-			//if cookie.verifyWriteToken(token) == false {
-			if cookie.verifyRevokeToken(token) == false {
-				http.Error(w, "Invalid token", http.StatusForbidden)
-				return
-			}
-			err = volume.deleteBlob(blobName)
-			if err != nil {
-				if os.IsNotExist(err) {
-					http.NotFound(w, r)
-					return
-				} else {
-					log.Fatal(err)
-					http.Error(w, "Failed to read server cookie", http.StatusInternalServerError)
-					return
-				}
-			}
-		} else {
-			if cookie.verifyRevokeToken(token) == false {
-				http.Error(w, "Invalid token", http.StatusForbidden)
-				return
-			}
-			err = volume.delete()
-			if err != nil {
-				log.Fatal(err)
-				http.Error(w, "Failed to delete volume", http.StatusInternalServerError)
-				return
-			}
-		}
-		// use Error for convenience, though no error is reported here
-		http.Error(w, "Deletion successful", http.StatusNoContent)
-	default:
-		log.Fatal("Unexpected request")
-		http.Error(w, "Invalid request method", http.StatusBadRequest)
-		return
-	}
-}
-
-func main() {
-	http.HandleFunc("/", handler)
-	http.HandleFunc("/_new", createHandler)
-	http.ListenAndServe(":8080", nil)
 }
